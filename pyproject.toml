@@ -1,0 +1,12 @@
+[project]
+name = "n8n-dataops-alerts"
+version = "1.0.0"
+description = "Event-driven DataOps alerting with n8n: normalise, classify, de-duplicate and route pipeline alerts."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Pradeep Kumar Yenni" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

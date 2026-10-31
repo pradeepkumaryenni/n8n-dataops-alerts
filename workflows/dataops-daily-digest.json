@@ -1,0 +1,293 @@
+{
+  "id": "dataopsDigest001",
+  "versionId": "3e4750aa-e094-530b-bc52-051fd2e9ae0d",
+  "active": true,
+  "name": "DataOps Daily Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Daily digest of LOW alerts\nRuns at 08:00 (GENERIC_TIMEZONE). The webhook trigger exists so the demo can run it on demand. Alerts are marked digested only after the email was sent (at-least-once).",
+        "height": 620,
+        "width": 1300,
+        "color": 6
+      },
+      "id": "af393b2f-e40c-5ec0-9628-53ad568c860b",
+      "name": "Note: Digest",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "13bcb08b-7076-5423-8491-e412245cf7dc",
+      "name": "Every Day 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dataops-digest",
+        "authentication": "basicAuth",
+        "responseMode": "lastNode",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "529c55eb-f950-516a-acc1-47fdb44b5b4d",
+      "name": "Run Digest Now (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        320
+      ],
+      "webhookId": "dcc5ff2e-d28f-5e75-8391-73cddf573991",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "dataopsHookAuth1",
+          "name": "Alert webhook (basic auth)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH pending AS (\n    SELECT * FROM alerting.alert_log\n     WHERE severity = 'LOW' AND digested_at IS NULL\n), grouped AS (\n    SELECT fingerprint, pipeline, environment, source, event_type,\n           count(*)::int AS events,\n           min(received_at) AS first_seen,\n           max(received_at) AS last_seen,\n           (array_agg(summary ORDER BY alert_id DESC))[1] AS latest_summary\n      FROM pending\n     GROUP BY fingerprint, pipeline, environment, source, event_type\n)\nSELECT (SELECT count(*)::int FROM pending) AS alert_count,\n       (SELECT count(*)::int FROM grouped) AS group_count,\n       (SELECT max(alert_id) FROM pending) AS cutoff_alert_id,\n       COALESCE((SELECT jsonb_agg(to_jsonb(g) ORDER BY g.last_seen DESC) FROM grouped g), '[]'::jsonb) AS groups;",
+        "options": {}
+      },
+      "id": "2773538f-b876-5bc0-8276-97c8e16fcf94",
+      "name": "Fetch Pending LOW Alerts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        240,
+        200
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "dataopsPostgres1",
+          "name": "DataOps alert log (Postgres)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Build Digest (n8n Code node, \"Run Once for All Items\")\n//\n// Input: one row from the \"Fetch Pending LOW Alerts\" query:\n//   {alert_count, group_count, cutoff_alert_id, groups: [{fingerprint, pipeline, environment, source,\n//    event_type, events, first_seen, last_seen, latest_summary}]}\n// Output: the same row plus the digest email subject, HTML and plain-text bodies.\n\nfunction escapeHtml(value) {\n  return String(value === undefined || value === null ? '' : value)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n}\n\nfunction plural(n, word) {\n  return `${n} ${word}${n === 1 ? '' : 's'}`;\n}\n\nfunction buildDigest(row) {\n  const groups = Array.isArray(row.groups) ? row.groups : [];\n  const alertCount = Number(row.alert_count || 0);\n  const subject = `DataOps daily digest: ${plural(alertCount, 'low-severity alert')} across ${plural(groups.length, 'pipeline')}`;\n  const header = ['Pipeline', 'Env', 'Source', 'Type', 'Events', 'First seen (UTC)', 'Last seen (UTC)', 'Latest summary'];\n  const lines = groups.map((g) => [\n    g.pipeline,\n    g.environment,\n    g.source,\n    g.event_type,\n    g.events,\n    String(g.first_seen || '').slice(0, 19).replace('T', ' '),\n    String(g.last_seen || '').slice(0, 19).replace('T', ' '),\n    g.latest_summary,\n  ]);\n  const html = [\n    `<h2>${escapeHtml(subject)}</h2>`,\n    '<p>LOW alerts are not sent one by one. They are collected here once a day.</p>',\n    '<table border=\"1\" cellpadding=\"4\" style=\"border-collapse:collapse\">',\n    `<tr>${header.map((h) => `<th align=\"left\">${h}</th>`).join('')}</tr>`,\n    ...lines.map((cells) => `<tr>${cells.map((c) => `<td>${escapeHtml(c)}</td>`).join('')}</tr>`),\n    '</table>',\n  ].join('\\n');\n  const text = [subject, '', ...lines.map((c) => `- ${c[0]} [${c[1]}] ${c[3]} x${c[4]}: ${c[7]}`)].join('\\n');\n  return { ...row, alert_count: alertCount, subject, html, text };\n}\n\nreturn $input.all().map((item) => ({ json: buildDigest(item.json) }));\n"
+      },
+      "id": "2c2bc104-5f4c-5de9-b651-f341736e7caf",
+      "name": "Build Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        200
+      ],
+      "notes": "Groups LOW alerts per fingerprint into one email.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "afbd34b6-e9fb-5047-a2a0-442b6ce5f128",
+              "leftValue": "={{ $json.alert_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7f0a12eb-a764-549c-a105-72a35a8d4269",
+      "name": "Anything to Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM }}",
+        "toEmail": "={{ $env.DIGEST_EMAIL_TO }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "both",
+        "text": "={{ $json.text }}",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "0bd9488e-9484-5c97-a322-48ab8d57b7f0",
+      "name": "Email: Send Digest",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        900,
+        100
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "dataopsSmtpMail1",
+          "name": "SMTP (alert email)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH marked AS (\n    UPDATE alerting.alert_log\n       SET digested_at = clock_timestamp()\n     WHERE severity = 'LOW' AND digested_at IS NULL AND alert_id <= $1\n    RETURNING alert_id\n)\nSELECT count(*)::int AS marked_digested FROM marked;",
+        "options": {
+          "queryReplacement": "={{ [ $('Build Digest').item.json.cutoff_alert_id ] }}"
+        }
+      },
+      "id": "3b642d70-1a7b-5fd6-9d0a-3081385b55a7",
+      "name": "Mark Digested",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1120,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "dataopsPostgres1",
+          "name": "DataOps alert log (Postgres)"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "d509e6f3-7e73-59fc-9df9-0e498e48b711",
+      "name": "Nothing to Digest",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        900,
+        320
+      ]
+    }
+  ],
+  "connections": {
+    "Every Day 08:00": {
+      "main": [
+        [
+          {
+            "node": "Fetch Pending LOW Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Digest Now (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Pending LOW Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Pending LOW Alerts": {
+      "main": [
+        [
+          {
+            "node": "Build Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest": {
+      "main": [
+        [
+          {
+            "node": "Anything to Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything to Send?": {
+      "main": [
+        [
+          {
+            "node": "Email: Send Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing to Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Send Digest": {
+      "main": [
+        [
+          {
+            "node": "Mark Digested",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "dataopsErrorWf01",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "description": "Sends one email a day with all LOW alerts not yet digested."
+  },
+  "tags": []
+}

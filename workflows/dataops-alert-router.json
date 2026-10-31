@@ -1,0 +1,864 @@
+{
+  "id": "dataopsAlertRtr1",
+  "versionId": "ac795abb-5040-515f-a630-340006a653b3",
+  "active": true,
+  "name": "DataOps Alert Router",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 1. Intake\nDatabricks job webhooks, Azure Monitor (ADF) alerts and generic JSON arrive on `POST /webhook/dataops-alert` (basic auth). Normalise maps them to one schema; Classify applies ordered severity rules.",
+        "height": 420,
+        "width": 900,
+        "color": 7
+      },
+      "id": "269cd42a-07b6-597b-9209-71a086190788",
+      "name": "Note: Intake",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2. Idempotency + de-dup + log\n`alerting.register_alert()` runs in one Postgres call under an advisory lock: replays are detected by event_id, repeats inside the window are SUPPRESSED, everything is written to `alert_log`. The webhook is acknowledged after this.",
+        "height": 420,
+        "width": 680,
+        "color": 5
+      },
+      "id": "9b2b8711-2b3a-5675-adcb-f4dc3a6ecefd",
+      "name": "Note: State",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        880,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3. Route by decision\nPAGE: Slack + Jira + email. NOTIFY: Slack + Jira. RESOLVE: Slack. DIGEST: picked up by the daily digest workflow. Branches run top to bottom (Slack, email, then Jira); each channel retries 3x and a failure is recorded per channel instead of blocking the others.",
+        "height": 1200,
+        "width": 1180,
+        "color": 4
+      },
+      "id": "7fadb222-cca5-5bad-a1b8-8ea05ff11308",
+      "name": "Note: Routing",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1600,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dataops-alert",
+        "authentication": "basicAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "df1d34b1-fb94-5f68-907d-8f577373f736",
+      "name": "Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "1988b642-8db1-5dce-8a2f-14ab4d5e1af6",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "dataopsHookAuth1",
+          "name": "Alert webhook (basic auth)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Normalise Payload (n8n Code node, \"Run Once for All Items\")\n//\n// Maps the inbound shapes this router understands onto one canonical alert record:\n//   1. Databricks job notification webhook  {event_type: \"jobs.on_failure\", workspace_id, run: {run_id}, job: {job_id, name}}\n//   2. Azure Monitor common alert schema    {schemaId: \"azureMonitorCommonAlertSchema\", data: {essentials, alertContext}}\n//      (this is what an Azure Data Factory metric alert such as PipelineFailedRuns sends to a webhook)\n//   3. Generic JSON from in-house checks    {source, event_type, status, pipeline, environment, message, event_id}\n// Any other JSON object is kept as source \"unknown\" (never silently dropped): it is logged and lands\n// in the LOW digest. A body that is not a JSON object throws, which fails the execution and fires the\n// error workflow.\n\n// Databricks webhooks carry a workspace id, not an environment name. In production this lookup would\n// live in a config table; the ids below are the sample ids used by the simulator.\nconst DATABRICKS_WORKSPACES = {\n  '1234567890123456': { environment: 'prod', host: 'https://adb-1234567890123456.7.azuredatabricks.net' },\n  '2345678901234567': { environment: 'dev', host: 'https://adb-2345678901234567.7.azuredatabricks.net' },\n};\n\nconst DATABRICKS_EVENTS = {\n  'jobs.on_failure': { event_type: 'failure', status: 'FIRING', detail: 'Job run failed' },\n  'jobs.on_duration_warning_threshold_exceeded': {\n    event_type: 'sla_breach',\n    status: 'FIRING',\n    detail: 'Run exceeded the job duration warning threshold',\n  },\n  'jobs.on_streaming_backlog_exceeded': {\n    event_type: 'sla_breach',\n    status: 'FIRING',\n    detail: 'Streaming backlog exceeded the configured threshold',\n  },\n  // A successful run resolves an earlier failure for the same job.\n  'jobs.on_success': { event_type: 'failure', status: 'RESOLVED', detail: 'Job run succeeded' },\n  'jobs.on_start': { event_type: 'info', status: 'FIRING', detail: 'Job run started' },\n};\n\n// Azure Data Factory metric names -> canonical event type.\nconst AZURE_METRIC_EVENTS = {\n  PipelineFailedRuns: 'failure',\n  ActivityFailedRuns: 'failure',\n  TriggerFailedRuns: 'failure',\n  PipelineElapsedTimeRuns: 'sla_breach',\n};\n\nconst ENV_ALIASES = { prd: 'prod', production: 'prod', development: 'dev', stg: 'staging' };\n\nfunction clean(value, fallback = 'unknown') {\n  const text = value === undefined || value === null ? '' : String(value).trim();\n  return text || fallback;\n}\n\nfunction envFromName(name) {\n  const match = /(?:^|[-_.])(prod|prd|production|dev|development|test|qa|uat|stg|staging|sandbox)(?:$|[-_.])/i.exec(\n    name || '',\n  );\n  if (!match) return null;\n  const env = match[1].toLowerCase();\n  return ENV_ALIASES[env] || env;\n}\n\nfunction normaliseEnv(value) {\n  const env = clean(value).toLowerCase();\n  return ENV_ALIASES[env] || env;\n}\n\nfunction isoOrNull(value) {\n  if (!value) return null;\n  const date = new Date(value);\n  return Number.isNaN(date.getTime()) ? null : date.toISOString();\n}\n\n// Small, dependency-free FNV-1a hash, used only to derive an id when a payload has none.\nfunction fnv1a(text) {\n  let hash = 0x811c9dc5;\n  for (let i = 0; i < text.length; i += 1) {\n    hash ^= text.charCodeAt(i);\n    hash = Math.imul(hash, 0x01000193) >>> 0;\n  }\n  return hash.toString(16).padStart(8, '0');\n}\n\nfunction fromDatabricks(body) {\n  const mapped = DATABRICKS_EVENTS[body.event_type] || { event_type: 'info', status: 'FIRING', detail: body.event_type };\n  const job = body.job || {};\n  const run = body.run || {};\n  const workspaceId = clean(body.workspace_id);\n  const workspace = DATABRICKS_WORKSPACES[workspaceId] || {};\n  const runId = run.run_id === undefined || run.run_id === null ? null : String(run.run_id);\n  const jobId = clean(job.job_id);\n  return {\n    source: 'databricks',\n    source_label: 'Databricks job',\n    source_event: body.event_type,\n    // Databricks sends no event id; (workspace, job, run, event type) identifies one notification.\n    event_id: `databricks:${workspaceId}:${jobId}:${runId || 'na'}:${body.event_type}`,\n    event_type: mapped.event_type,\n    status: mapped.status,\n    pipeline: clean(job.name),\n    environment: workspace.environment || envFromName(job.name) || 'unknown',\n    run_id: runId,\n    run_url: workspace.host && runId ? `${workspace.host}/jobs/${jobId}/runs/${runId}` : null,\n    // The webhook does not include the error text; production would enrich it via the Jobs API (runs/get).\n    error_message: mapped.detail,\n    upstream_severity: null,\n    occurred_at: null,\n  };\n}\n\nfunction fromAzureMonitor(body) {\n  const essentials = body.data.essentials || {};\n  const context = body.data.alertContext || {};\n  const condition = (context.condition && Array.isArray(context.condition.allOf) && context.condition.allOf[0]) || {};\n  const dims = {};\n  for (const d of condition.dimensions || []) dims[d.name] = d.value;\n  const resourceId = (essentials.alertTargetIDs || [])[0] || '';\n  const resourceName = clean(resourceId.split('/').pop() || (essentials.configurationItems || [])[0]);\n  const metric = condition.metricName || null;\n  const isDataFactory = /microsoft\\.datafactory/i.test(resourceId) || /DataFactory/i.test(condition.metricNamespace || '');\n  const status = essentials.monitorCondition === 'Resolved' ? 'RESOLVED' : 'FIRING';\n  const custom = body.data.customProperties || {};\n  let detail = essentials.description || null;\n  if (!detail && metric) {\n    detail = `${metric} ${condition.operator || ''} ${condition.threshold ?? ''}`.replace(/\\s+/g, ' ').trim();\n    if (condition.metricValue !== undefined) detail += ` (observed ${condition.metricValue})`;\n    if (dims.FailureType) detail += `, FailureType=${dims.FailureType}`;\n  }\n  return {\n    source: 'azure_monitor',\n    source_label: isDataFactory ? 'ADF pipeline' : 'Azure resource',\n    source_event: `${essentials.signalType || 'Unknown'}/${metric || essentials.alertRule || 'alert'}`,\n    // Fired and Resolved notifications share alertId, so the status is part of the idempotency key.\n    event_id: `azure:${essentials.alertId || fnv1a(JSON.stringify(body))}:${status}`,\n    event_type: AZURE_METRIC_EVENTS[metric] || (/fail/i.test(essentials.alertRule || '') ? 'failure' : 'info'),\n    status,\n    pipeline: clean(dims.Name || dims.PipelineName || essentials.alertRule),\n    environment: normaliseEnv(custom.environment || envFromName(resourceName) || 'unknown'),\n    run_id: dims.RunId || null,\n    run_url: resourceId ? `https://portal.azure.com/#resource${resourceId}/overview` : null,\n    error_message: detail,\n    upstream_severity: essentials.severity || null,\n    occurred_at: isoOrNull(status === 'RESOLVED' ? essentials.resolvedDateTime : essentials.firedDateTime),\n    resource: resourceName,\n    alert_rule: essentials.alertRule || null,\n  };\n}\n\nfunction fromGeneric(body) {\n  const source = clean(body.source).toLowerCase().replace(/[^a-z0-9_.-]+/g, '_');\n  const status = String(body.status || 'FIRING').toUpperCase() === 'RESOLVED' ? 'RESOLVED' : 'FIRING';\n  const eventType = ['failure', 'sla_breach'].includes(body.event_type) ? body.event_type : 'info';\n  return {\n    source,\n    source_label: clean(body.source_label, 'Pipeline'),\n    source_event: body.event_type || null,\n    event_id: `${source}:${body.event_id ? String(body.event_id) : fnv1a(JSON.stringify(body))}`,\n    event_type: eventType,\n    status,\n    pipeline: clean(body.pipeline),\n    environment: normaliseEnv(body.environment || envFromName(body.pipeline) || 'unknown'),\n    run_id: body.run_id === undefined || body.run_id === null ? null : String(body.run_id),\n    run_url: body.run_url || null,\n    error_message: body.message || body.error || null,\n    upstream_severity: body.severity || null,\n    occurred_at: isoOrNull(body.occurred_at),\n  };\n}\n\nfunction fromUnknown(body) {\n  const text = JSON.stringify(body);\n  return {\n    source: 'unknown',\n    source_label: 'Unrecognised sender',\n    source_event: null,\n    event_id: `unknown:${fnv1a(text)}`,\n    event_type: 'info',\n    status: 'FIRING',\n    pipeline: 'unknown',\n    environment: 'unknown',\n    run_id: null,\n    run_url: null,\n    error_message: `Unrecognised payload: ${text.slice(0, 300)}`,\n    upstream_severity: null,\n    occurred_at: null,\n  };\n}\n\nfunction normalise(body, receivedAt) {\n  if (body === null || typeof body !== 'object' || Array.isArray(body)) {\n    throw new Error('Unsupported payload: expected a JSON object in the request body');\n  }\n  let alert;\n  if (typeof body.event_type === 'string' && body.event_type.startsWith('jobs.') && body.job) {\n    alert = fromDatabricks(body);\n  } else if (body.schemaId === 'azureMonitorCommonAlertSchema' && body.data && body.data.essentials) {\n    alert = fromAzureMonitor(body);\n  } else if (body.source && body.pipeline) {\n    alert = fromGeneric(body);\n  } else {\n    alert = fromUnknown(body);\n  }\n  alert.fingerprint = [alert.source, alert.environment, alert.pipeline, alert.event_type].join(':').toLowerCase();\n  alert.received_at = receivedAt;\n  alert.raw = body;\n  return alert;\n}\n\nconst receivedAt = new Date().toISOString();\nreturn $input.all().map((item) => ({ json: normalise(item.json.body, receivedAt) }));\n"
+      },
+      "id": "df91c553-16fe-57b9-be89-c63302d13b61",
+      "name": "Normalise Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Databricks / Azure Monitor / generic payload -> canonical alert + fingerprint + event_id.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Classify Severity (n8n Code node, \"Run Once for All Items\")\n//\n// Ordered rules, first match wins. Each alert gets a severity, the id and reason of the rule that\n// matched (so every routing decision can be explained), a route and a rule-based summary.\n//\n//   severity  -> route\n//   CRITICAL  -> PAGE    Slack + Jira + email to on-call\n//   HIGH      -> NOTIFY  Slack + Jira\n//   LOW       -> DIGEST  daily digest email\n//   INFO      -> RESOLVE recovery events (Slack \"resolved\" if an alert was open)\n\n// Business tier per pipeline / job (1 = revenue or regulatory impact). Unlisted pipelines are tier 3.\n// In production this would be a config table owned by the data platform team.\nconst PIPELINE_TIERS = {\n  nightly_sales_etl: 1,\n  pl_load_finance_gl: 1,\n  'gold.sales_daily': 1,\n  pl_ingest_crm_accounts: 2,\n  customer_360_refresh: 2,\n  pl_refresh_marketing_lookup: 3,\n};\n\nconst NON_PROD = new Set(['dev', 'test', 'qa', 'uat', 'staging', 'sandbox']);\n\nconst ROUTE_BY_SEVERITY = { CRITICAL: 'PAGE', HIGH: 'NOTIFY', LOW: 'DIGEST', INFO: 'RESOLVE' };\n\nconst RULES = [\n  {\n    id: 'R1_recovery',\n    when: (a) => a.status === 'RESOLVED',\n    severity: 'INFO',\n    reason: 'Recovery event, closes any open alert for the same pipeline',\n  },\n  {\n    id: 'R2_non_prod',\n    when: (a) => NON_PROD.has(a.environment),\n    severity: 'LOW',\n    reason: 'Non-production environment',\n  },\n  {\n    id: 'R3_tier1_failure',\n    when: (a) => a.event_type === 'failure' && a.tier === 1,\n    severity: 'CRITICAL',\n    reason: 'Tier-1 pipeline failed in production',\n  },\n  {\n    id: 'R4_upstream_sev0_sev1',\n    when: (a) => a.event_type !== 'info' && ['Sev0', 'Sev1'].includes(a.upstream_severity),\n    severity: 'CRITICAL',\n    reason: 'Azure Monitor alert rule is Sev0/Sev1',\n  },\n  {\n    id: 'R5_prod_failure',\n    when: (a) => a.event_type === 'failure',\n    severity: 'HIGH',\n    reason: 'Production pipeline failure',\n  },\n  {\n    id: 'R6_sla_breach_tier1_2',\n    when: (a) => a.event_type === 'sla_breach' && a.tier <= 2,\n    severity: 'HIGH',\n    reason: 'SLA breach on a tier-1/2 pipeline',\n  },\n  {\n    id: 'R7_default_low',\n    when: () => true,\n    severity: 'LOW',\n    reason: 'Low-impact or informational event',\n  },\n];\n\nfunction describe(alert) {\n  if (alert.status === 'RESOLVED') return 'recovered';\n  if (alert.event_type === 'failure') return 'failed';\n  if (alert.event_type === 'sla_breach') return 'breached its SLA';\n  return 'reported an event';\n}\n\nfunction classify(alert) {\n  const tier = Object.prototype.hasOwnProperty.call(PIPELINE_TIERS, alert.pipeline) ? PIPELINE_TIERS[alert.pipeline] : 3;\n  const ctx = { ...alert, tier };\n  const rule = RULES.find((r) => r.when(ctx));\n  const run = alert.run_id ? ` (run ${alert.run_id})` : '';\n  return {\n    ...alert,\n    tier,\n    severity: rule.severity,\n    severity_rule: rule.id,\n    severity_reason: rule.reason,\n    route: ROUTE_BY_SEVERITY[rule.severity],\n    summary: `[${rule.severity}] ${alert.source_label} ${alert.pipeline} ${describe(alert)} in ${alert.environment}${run}. ${rule.reason}.`,\n    summary_source: 'rules',\n  };\n}\n\nreturn $input.all().map((item) => ({ json: classify(item.json) }));\n"
+      },
+      "id": "1fdb8619-b31f-53d8-ab61-f302ff081f2c",
+      "name": "Classify Severity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Ordered rules (first match wins) -> severity, rule id, reason, route, summary.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.LLM_API_BASE || 'https://api.openai.com/v1').replace(/\\/$/, '') + '/chat/completions' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.LLM_MODEL || 'gpt-4o-mini', temperature: 0.2, max_tokens: 160, messages: [ { role: 'system', content: 'You summarise data pipeline alerts for an on-call data engineer in at most two sentences: what failed and the first thing to check. Use only the facts given.' }, { role: 'user', content: JSON.stringify({ pipeline: $json.pipeline, environment: $json.environment, severity: $json.severity, event: $json.source_event, detail: $json.error_message, rule: $json.severity_reason }) } ] }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "65bad1f0-7a1f-5989-97cd-c9b340c15834",
+      "name": "LLM Summary (optional)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "disabled": true,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "dataopsLlmKey001",
+          "name": "LLM API key (optional)"
+        }
+      },
+      "notes": "Disabled by default. Enable to replace the rule-based summary with an LLM one. Errors continue, so the LLM never blocks an alert."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Attach Summary (n8n Code node, \"Run Once for All Items\")\n//\n// The \"LLM Summary (optional)\" node before this one is disabled by default, so n8n passes the\n// classified alert straight through and the rule-based summary is kept. If the LLM node is enabled\n// and returns an OpenAI-style chat completion, its text replaces the summary. If the LLM call fails\n// (the node is set to continue on error) the rule-based summary is kept: the LLM is advisory and is\n// never on the critical path of an alert.\n\nconst classified = $('Classify Severity').all();\n\nfunction llmText(json) {\n  const choice = json && Array.isArray(json.choices) ? json.choices[0] : null;\n  const text = choice && choice.message ? choice.message.content : null;\n  return typeof text === 'string' && text.trim() ? text.trim().slice(0, 600) : null;\n}\n\nreturn $input.all().map((item, index) => {\n  const alert = classified[index] ? classified[index].json : item.json;\n  const text = llmText(item.json);\n  return {\n    json: {\n      ...alert,\n      summary: text || alert.summary,\n      summary_source: text ? 'llm' : 'rules',\n    },\n  };\n});\n"
+      },
+      "id": "850ceb16-dba4-5466-8349-919909fc4582",
+      "name": "Attach Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Keeps the rule-based summary unless the LLM node produced text.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM alerting.register_alert($1::jsonb, $2::int);",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json), Number($env.DEDUP_WINDOW_MINUTES || 15) ] }}"
+        }
+      },
+      "id": "05c6456d-d653-5d9c-b6dd-41bf481edc99",
+      "name": "Dedup + Log Alert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "dataopsPostgres1",
+          "name": "DataOps alert log (Postgres)"
+        }
+      },
+      "notes": "Atomic: idempotency on event_id, de-dup window per fingerprint, insert into alerting.alert_log."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ alert_id: Number($json.alert_id), decision: $json.decision, replay: $json.is_replay, occurrence: $json.occurrence, severity: $json.alert.severity, rule: $json.alert.severity_rule, fingerprint: $json.alert.fingerprint }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "39991167-2d53-5df9-a065-a4d3d1ec3bc5",
+      "name": "Acknowledge Sender",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1320,
+        300
+      ],
+      "notes": "Responds once the alert is durably logged; fan-out continues after the response."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Build Notifications (n8n Code node, \"Run Once for All Items\")\n//\n// Input: the row returned by alerting.register_alert() (alert_id, decision, occurrence, is_replay,\n// window_started_at, alert). Output: the alert plus ready-to-send Slack, Jira and email payloads and\n// the `action` the router switches on. Environment-specific values (Jira project key, issue type,\n// addresses) are added in the sending nodes from env vars, so this code stays pure and testable.\n\nconst EMOJI = { CRITICAL: ':rotating_light:', HIGH: ':warning:', LOW: ':information_source:', INFO: ':white_check_mark:' };\nconst NOTIFYING = new Set(['PAGE', 'NOTIFY', 'RESOLVE', 'DIGEST']);\n\nfunction escapeHtml(value) {\n  return String(value === undefined || value === null ? '' : value)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n}\n\nfunction verb(a) {\n  if (a.status === 'RESOLVED') return 'recovered';\n  if (a.event_type === 'failure') return 'failed';\n  if (a.event_type === 'sla_breach') return 'breached SLA';\n  return 'event';\n}\n\nfunction slackMessage(a) {\n  const resolved = a.decision === 'RESOLVE';\n  const title = resolved\n    ? `RESOLVED: ${a.pipeline} (${a.environment})`\n    : `${a.severity}: ${a.pipeline} ${verb(a)} (${a.environment})`;\n  const run = a.run_url ? `<${a.run_url}|${a.run_id || 'open'}>` : a.run_id || '-';\n  return {\n    text: `${EMOJI[resolved ? 'INFO' : a.severity] || ''} ${title}`.trim(),\n    blocks: [\n      { type: 'header', text: { type: 'plain_text', text: title.slice(0, 150) } },\n      {\n        type: 'section',\n        fields: [\n          { type: 'mrkdwn', text: `*Source*\\n${a.source_label}` },\n          { type: 'mrkdwn', text: `*Environment*\\n${a.environment}` },\n          { type: 'mrkdwn', text: `*Run*\\n${run}` },\n          { type: 'mrkdwn', text: `*Alert id*\\n${a.alert_id}` },\n        ],\n      },\n      {\n        type: 'section',\n        text: {\n          type: 'mrkdwn',\n          text: `*Summary:* ${a.summary}\\n*Detail:* ${a.error_message || '-'}\\n*Rule:* ${a.severity_rule}`,\n        },\n      },\n      { type: 'context', elements: [{ type: 'mrkdwn', text: `fingerprint \\`${a.fingerprint}\\`` }] },\n    ],\n  };\n}\n\nfunction jiraFields(a) {\n  const description = [\n    a.summary,\n    '',\n    `*Source:* ${a.source_label} (${a.source_event || a.source})`,\n    `*Pipeline:* ${a.pipeline}`,\n    `*Environment:* ${a.environment}`,\n    `*Run:* ${a.run_id || '-'} ${a.run_url || ''}`.trim(),\n    `*Detail:* ${a.error_message || '-'}`,\n    `*Severity rule:* ${a.severity_rule} - ${a.severity_reason}`,\n    `*Fingerprint:* ${a.fingerprint}`,\n    `*Alert id:* ${a.alert_id}`,\n  ].join('\\n');\n  return {\n    summary: `[${a.severity}] ${a.pipeline} ${verb(a)} (${a.environment})`.slice(0, 250),\n    description,\n    priority: { name: a.severity === 'CRITICAL' ? 'Highest' : 'High' },\n    labels: ['dataops-alert', `severity-${String(a.severity).toLowerCase()}`, `source-${a.source}`],\n  };\n}\n\nfunction email(a) {\n  const runCell = a.run_url\n    ? `<a href=\"${escapeHtml(a.run_url)}\">${escapeHtml(a.run_id || a.run_url)}</a>`\n    : escapeHtml(a.run_id || '-');\n  const rows = [\n    ['Severity', escapeHtml(`${a.severity} (rule ${a.severity_rule})`), `${a.severity} (rule ${a.severity_rule})`],\n    ['Why', escapeHtml(a.severity_reason), a.severity_reason],\n    ['Source', escapeHtml(`${a.source_label} - ${a.source_event || a.source}`), `${a.source_label} - ${a.source_event || a.source}`],\n    ['Pipeline', escapeHtml(a.pipeline), a.pipeline],\n    ['Environment', escapeHtml(a.environment), a.environment],\n    ['Run', runCell, `${a.run_id || '-'} ${a.run_url || ''}`.trim()],\n    ['Detail', escapeHtml(a.error_message || '-'), a.error_message || '-'],\n    ['Fingerprint', escapeHtml(a.fingerprint), a.fingerprint],\n    ['Alert id', escapeHtml(a.alert_id), String(a.alert_id)],\n  ];\n  const html = [\n    `<h2>${escapeHtml(a.summary)}</h2>`,\n    '<table cellpadding=\"4\" style=\"border-collapse:collapse\">',\n    ...rows.map(([label, htmlValue], i) => `<tr${i % 2 ? '' : ' style=\"background:#f4f4f4\"'}><th align=\"left\">${label}</th><td>${htmlValue}</td></tr>`),\n    '</table>',\n    '<p>Sent by the n8n DataOps alert router. Repeats of this alert are suppressed for the de-duplication window.</p>',\n  ].join('\\n');\n  const text = [a.summary, '', ...rows.map(([label, , plain]) => `${label}: ${plain}`)].join('\\n');\n  return { subject: `[${a.severity}] ${a.pipeline} ${verb(a)} in ${a.environment}`, html, text };\n}\n\nfunction build(row) {\n  const a = {\n    ...row.alert,\n    alert_id: Number(row.alert_id),\n    decision: row.decision,\n    occurrence: Number(row.occurrence),\n    is_replay: row.is_replay === true || row.is_replay === 'true',\n  };\n  a.action = !a.is_replay && NOTIFYING.has(a.decision) ? a.decision : 'NONE';\n  a.slack = slackMessage(a);\n  a.jira = { fields: jiraFields(a) };\n  a.email = email(a);\n  return a;\n}\n\nreturn $input.all().map((item) => ({ json: build(item.json) }));\n"
+      },
+      "id": "8dae3586-c7a4-5ff9-8dcb-f4b39bcdce52",
+      "name": "Build Notifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ],
+      "notes": "Slack blocks, Jira fields and email bodies; sets `action` (NONE for suppress/replay/log-only).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "7dc79598-dc8e-5dba-b14d-3b28b89a745d",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "PAGE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "PAGE"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4f89ad62-3534-52db-8474-d1cd2ebd593d",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "NOTIFY",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "NOTIFY"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "1e324e95-e16d-57c3-b8ac-fab791f8e603",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "RESOLVE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "RESOLVE"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "962fd128-ce0c-57a5-9418-5be52a768073",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "DIGEST",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "DIGEST"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "NONE"
+        }
+      },
+      "id": "101c0afd-d2d0-5f02-bbf9-f7974fff2981",
+      "name": "Route by Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "0a3b4c14-faf1-5d28-8557-c5dcae55c890",
+      "name": "Slack: Post Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        60
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Slack incoming webhook (the mock receiver locally)."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JIRA_BASE_URL.replace(/\\/$/, '') }}/rest/api/2/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fields: Object.assign({}, $json.jira.fields, { project: { key: $env.JIRA_PROJECT_KEY || 'DATA' }, issuetype: { name: $env.JIRA_ISSUE_TYPE || 'Bug' } }) }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "1c706e89-d626-5aac-a8aa-a98138a31a5d",
+      "name": "Jira: Create Issue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        540
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "dataopsJiraAuth1",
+          "name": "Jira API (basic auth)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Jira REST v2 create issue (the mock receiver locally)."
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM }}",
+        "toEmail": "={{ $env.ONCALL_EMAIL_TO }}",
+        "subject": "={{ $json.email.subject }}",
+        "emailFormat": "both",
+        "text": "={{ $json.email.text }}",
+        "html": "={{ $json.email.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "6d19a2fd-c862-572a-b5cc-e825061c29b6",
+      "name": "Email: Page On-call",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2040,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "dataopsSmtpMail1",
+          "name": "SMTP (alert email)"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "SMTP (Mailpit locally). CRITICAL only."
+    },
+    {
+      "parameters": {},
+      "id": "c858c0d7-6ddc-5a65-8fab-6854de502661",
+      "name": "Queued for Daily Digest",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2040,
+        760
+      ],
+      "notes": "LOW alerts are already in alert_log; the digest workflow sends them once a day."
+    },
+    {
+      "parameters": {},
+      "id": "3ba3339d-9cce-5058-8ced-1504e81e3dd7",
+      "name": "No Notification",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2040,
+        920
+      ],
+      "notes": "SUPPRESS (duplicate in window), LOG_ONLY (recovery with nothing open) or a replayed event."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "de8a93b8-fecf-551a-98d0-9b444772e781",
+              "name": "alert_id",
+              "value": "={{ $('Build Notifications').item.json.alert_id }}",
+              "type": "number"
+            },
+            {
+              "id": "e25625be-264d-5a81-9884-eaff26916bbf",
+              "name": "channel",
+              "value": "slack",
+              "type": "string"
+            },
+            {
+              "id": "4e2f7b7b-81a7-5428-9edd-e456c42c87e2",
+              "name": "status",
+              "value": "={{ $json.error ? 'FAILED' : 'SENT' }}",
+              "type": "string"
+            },
+            {
+              "id": "1242db61-ec6b-5a95-9c64-2acd30fb5477",
+              "name": "external_ref",
+              "value": "={{ $json.error ? '' : ('') }}",
+              "type": "string"
+            },
+            {
+              "id": "aaed4fd8-5fe3-510e-9ded-48f40d953f4d",
+              "name": "detail",
+              "value": "={{ $json.error ? String($json.error.message || JSON.stringify($json.error)).slice(0, 500) : 'Slack webhook returned 2xx' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b99a3cdf-63a3-566d-b4bd-17afcf190e0a",
+      "name": "Slack Result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2300,
+        60
+      ],
+      "notes": "Turns the slack success or error output into one delivery_log row."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "7e6739a6-630d-54da-9e00-0e2e5457ce46",
+              "name": "alert_id",
+              "value": "={{ $('Build Notifications').item.json.alert_id }}",
+              "type": "number"
+            },
+            {
+              "id": "b4d94d43-4900-5364-ab72-3f8f7cd052ca",
+              "name": "channel",
+              "value": "jira",
+              "type": "string"
+            },
+            {
+              "id": "ed7b6954-88b3-5d38-9645-62fdae531ac3",
+              "name": "status",
+              "value": "={{ $json.error ? 'FAILED' : 'SENT' }}",
+              "type": "string"
+            },
+            {
+              "id": "22996109-9d79-5a0d-826e-06826577377e",
+              "name": "external_ref",
+              "value": "={{ $json.error ? '' : ($json.key || '') }}",
+              "type": "string"
+            },
+            {
+              "id": "b296e825-b070-5335-8b18-6f57fcc42e07",
+              "name": "detail",
+              "value": "={{ $json.error ? String($json.error.message || JSON.stringify($json.error)).slice(0, 500) : 'Jira issue created' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "8ee5a9ed-ec0f-5a5c-b3d7-9a90e0ca38f5",
+      "name": "Jira Result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2300,
+        540
+      ],
+      "notes": "Turns the jira success or error output into one delivery_log row."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d2476d1f-58f9-5073-abdc-ce9b75219daa",
+              "name": "alert_id",
+              "value": "={{ $('Build Notifications').item.json.alert_id }}",
+              "type": "number"
+            },
+            {
+              "id": "e8b60100-dc78-5fa6-b26c-c2a1a15cb783",
+              "name": "channel",
+              "value": "email",
+              "type": "string"
+            },
+            {
+              "id": "82dce3bb-f0e3-59b1-a1d5-df75ebabb617",
+              "name": "status",
+              "value": "={{ $json.error ? 'FAILED' : 'SENT' }}",
+              "type": "string"
+            },
+            {
+              "id": "a6af1bd1-fb38-5948-a5ec-3bc78f23302d",
+              "name": "external_ref",
+              "value": "={{ $json.error ? '' : ($json.messageId || '') }}",
+              "type": "string"
+            },
+            {
+              "id": "e6732729-b223-52a7-82df-ce6425f3df77",
+              "name": "detail",
+              "value": "={{ $json.error ? String($json.error.message || JSON.stringify($json.error)).slice(0, 500) : 'SMTP accepted the message' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a502b9f6-cba0-560d-b55f-f48c243fea64",
+      "name": "Email Result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2300,
+        300
+      ],
+      "notes": "Turns the email success or error output into one delivery_log row."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO alerting.delivery_log (alert_id, channel, status, external_ref, detail)\nVALUES ($1, $2, $3, NULLIF($4, ''), $5)\nRETURNING delivery_id, alert_id, channel, status, external_ref;",
+        "options": {
+          "queryReplacement": "={{ [ $json.alert_id, $json.channel, $json.status, $json.external_ref, $json.detail ] }}"
+        }
+      },
+      "id": "16439f79-efe9-5465-9882-ac567476abec",
+      "name": "Record Delivery",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2560,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "dataopsPostgres1",
+          "name": "DataOps alert log (Postgres)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalise Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Payload": {
+      "main": [
+        [
+          {
+            "node": "Classify Severity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Severity": {
+      "main": [
+        [
+          {
+            "node": "LLM Summary (optional)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Summary (optional)": {
+      "main": [
+        [
+          {
+            "node": "Attach Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Summary": {
+      "main": [
+        [
+          {
+            "node": "Dedup + Log Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedup + Log Alert": {
+      "main": [
+        [
+          {
+            "node": "Acknowledge Sender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Acknowledge Sender": {
+      "main": [
+        [
+          {
+            "node": "Build Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Notifications": {
+      "main": [
+        [
+          {
+            "node": "Route by Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Decision": {
+      "main": [
+        [
+          {
+            "node": "Slack: Post Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Jira: Create Issue",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email: Page On-call",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack: Post Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Jira: Create Issue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack: Post Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Queued for Daily Digest",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack: Post Alert": {
+      "main": [
+        [
+          {
+            "node": "Slack Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Result": {
+      "main": [
+        [
+          {
+            "node": "Record Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira: Create Issue": {
+      "main": [
+        [
+          {
+            "node": "Jira Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Jira Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira Result": {
+      "main": [
+        [
+          {
+            "node": "Record Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Page On-call": {
+      "main": [
+        [
+          {
+            "node": "Email Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Result": {
+      "main": [
+        [
+          {
+            "node": "Record Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "dataopsErrorWf01",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "description": "Receives pipeline failure / SLA events, classifies severity, de-duplicates, logs to Postgres and routes CRITICAL to Slack+Jira+email, HIGH to Slack+Jira, LOW to the daily digest."
+  },
+  "tags": []
+}

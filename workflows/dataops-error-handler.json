@@ -1,0 +1,117 @@
+{
+  "id": "dataopsErrorWf01",
+  "versionId": "394b4c45-5f26-5abe-98c0-e83264e2f2e6",
+  "active": true,
+  "name": "DataOps Alert Router - Error Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Error workflow\nSet as the error workflow of the router and the digest. Fires when an execution fails (bad payload, database down, a bug). Emails the platform team and logs to `alerting.workflow_error`; each branch continues on error so one failing does not hide the other.",
+        "height": 560,
+        "width": 760,
+        "color": 3
+      },
+      "id": "9b138cbd-1991-5642-8d0e-43d98a081bb9",
+      "name": "Note: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        -220
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "37ea4d80-c438-51a0-9416-f01e9166de0c",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "fromEmail": "={{ $env.ALERT_EMAIL_FROM }}",
+        "toEmail": "={{ $env.PLATFORM_EMAIL_TO }}",
+        "subject": "=[n8n] {{ $json.workflow.name }} execution {{ $json.execution.id }} failed at '{{ $json.execution.lastNodeExecuted }}'",
+        "emailFormat": "text",
+        "text": "=The alerting pipeline itself failed, so an alert may not have been routed.\n\nWorkflow: {{ $json.workflow.name }} ({{ $json.workflow.id }})\nExecution: {{ $json.execution.id }} {{ $json.execution.url }}\nFailed node: {{ $json.execution.lastNodeExecuted }}\nError: {{ $json.execution.error.message }}\n",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "01b86b09-143c-573c-96d9-66eeeff3adef",
+      "name": "Email: Platform Team",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        300,
+        -60
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "dataopsSmtpMail1",
+          "name": "SMTP (alert email)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO alerting.workflow_error (workflow_id, workflow_name, execution_id, execution_url, failed_node, error_message)\nVALUES ($1, $2, $3, $4, $5, $6)\nRETURNING error_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.workflow.id, $json.workflow.name, $json.execution.id, $json.execution.url, $json.execution.lastNodeExecuted, ($json.execution.error && $json.execution.error.message) || 'unknown error' ] }}"
+        }
+      },
+      "id": "804aba31-5ede-592e-b2e9-78eb77e27f2a",
+      "name": "Log Workflow Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        300,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "dataopsPostgres1",
+          "name": "DataOps alert log (Postgres)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Email: Platform Team",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Workflow Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "description": "Error workflow for the router and the digest."
+  },
+  "tags": []
+}
